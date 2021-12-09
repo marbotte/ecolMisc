@@ -37,3 +37,13 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# document produced by rmarkdown
+*.md
+*.pdf
+*.html
+!**/finaldoc/*.md
+
+# Unshared data
+/unsharedData/
+

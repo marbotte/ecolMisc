@@ -1,0 +1,71 @@
+---
+title: Non overlapping buffers for the Colombian parks
+author: Marius Bottin
+output: 
+  github_document:
+    toc: true
+    number_section: true
+---
+
+# Objectives
+
+In order to compare deforestation in the Colombian parks and their buffers, Kristian Rubiano and Nicola Clerici asked me whether it would be possible to find a way to create non-overlapping buffers.
+The main principle is that no area should be accounted for more than one time in the analyses.
+Since some of the parks share borders, we need to make sure that the buffers do not overlap, and that they do not overlap the parks neither.
+
+The real difficulty here is to find a method which cut the buffers and attribute the different parts to the closest park.
+
+We have tried different methods, but we finally chose to use the concept of Voronoi polygons out of input polygons, in order to find *influence zone* of the parks in the continental Colombia.
+
+# Requirements
+
+In order to reproduce this example, you will need:
+
+1. A postgreSQL database called "park" with postgis extension installed and authorized access for your user
+1. a table called park in the public schema containing the fields:
+   + *gid* integer primary key ids of the parks (in my case serial)
+   + *name* the name of the parks
+   + *the_geom* a spatial polygon field, consisting of polygons, in a spatial reference system in meters facilitating the creation of buffers with understandable values
+1. a table containing at least one spatial polygon representing the limit of the zone where you'll be working (in our case it the spatial polygon of continental Colombian territory). Note that the table needs to have the same spatial reference system than the 
+1. In order to make the figures: R, with package RPostgreSQL and rpostgis installed
+
+# Example for creating the database
+
+Your example might be different, but in order to show you how to create the database, I will share the following code:
+
+
+*As a user which has sufficient rights for creating roles and databases (might be the* postgres *user connected in the postgres database*):
+
+```sql
+CREATE ROLE park_user WITH LOGIN PASSWORD '*****'; -- replace park_user by you username and ***** by your password
+CREATE DATABASE park OWNER park_user; -- again replace park_user as your user
+```
+
+Then you connect, as a superuser again, to the park database, in order to insert the extension postgis in your database:
+
+```sql
+CREATE EXTENSION postgis;
+```
+
+Now you connect to the database as the user "park_user", or the user that you set as owner of the database (the user do not need to be the owner of the database, but need sufficient rights to apply the operations). If you do not know about rights and permission in the PostgreSQL database, a good start may be: <https://www.postgresql.org/docs/9.0/sql-grant.html>
+
+**Note**: I will use the [pgpass](https://www.postgresql.org/docs/9.3/libpq-pgpass.html) method, which consists in keeping the password in a file on my computer, which allows me not to put any password in this file. If you do not use it, you will need to explicitly give your password in order to connect to the database!
+
+## The park table
+
+### using shp2pgsql
+
+One of the simplest possibility for integrating spatial objects in a postgis database is to use the *shp2pgsql* software.
+
+In my computer, operated through Debian Linux, it may be done by sending the following command line:
+
+```sql
+shp2pgsql -s 3116 -g the_geom -I SINAP_2017.shp parks |  psql -d park -U park_user
+```
+
+**Note**: *-s 3116* is the option to make the park spatial object to use the Spatial Reference System: [Magnas Sirgas (Bogotá)](https://spatialreference.org/ref/epsg/magna-sirgas-colombia-bogota-zone/). You might want to use another reference system, but please know that a system which uses meters as a unit would simplify some operations
+
+### using R postgis package
+
+```bash
+```

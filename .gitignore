@@ -42,7 +42,9 @@ vignettes/*.pdf
 *.md
 *.pdf
 *.html
-!**/finaldoc/*.md
+**/*_files/
+!**/finalDoc/*.md
+!**/finalDoc/*_files/
 
 # Unshared data
 /unsharedData/

@@ -26,8 +26,8 @@ In order to reproduce this example, you will need:
    + *gid* integer primary key ids of the parks (in my case serial)
    + *name* the name of the parks
    + *the_geom* a spatial polygon field, consisting of polygons, in a spatial reference system in meters facilitating the creation of buffers with understandable values
-1. a table containing at least one spatial polygon representing the limit of the zone where you'll be working (in our case it the spatial polygon of continental Colombian territory). Note that the table needs to have the same spatial reference system than the 
-1. In order to make the figures: R, with package RPostgreSQL and rpostgis installed
+1. a table containing at least one spatial polygon representing the limit of the zone where you'll be working (in our case it the spatial polygon of continental Colombian territory). Note that the table needs to have the same spatial reference system than the polygons of the park table.
+1. In order to let R communicate with the database and make the figures: R, with packages *RPostgres*, *rpostgis*, *sp* and *rgdal* installed
 
 # Example for creating the database
 
@@ -53,19 +53,414 @@ Now you connect to the database as the user "park_user", or the user that you se
 
 ## The park table
 
-### using shp2pgsql
+We used the shapefile of the Colombian parks.
+Further information may be found at <http://181.225.72.78/Portal-SIAC-web/faces/Dashboard/Biodiversidad2/areas_protegidas/respuestaEcoRepresentativo.xhtml>.
+
 
 One of the simplest possibility for integrating spatial objects in a postgis database is to use the *shp2pgsql* software.
 
 In my computer, operated through Debian Linux, it may be done by sending the following command line:
 
 ```sql
-shp2pgsql -s 3116 -g the_geom -I SINAP_2017.shp parks |  psql -d park -U park_user
+shp2pgsql -s 3116 -g the_geom ../unsharedData/nonOverlapBuffers/SPNN_SEL.shp park_raw |  psql -d park -U park_user
 ```
 
 **Note**: *-s 3116* is the option to make the park spatial object to use the Spatial Reference System: [Magnas Sirgas (Bogotá)](https://spatialreference.org/ref/epsg/magna-sirgas-colombia-bogota-zone/). You might want to use another reference system, but please know that a system which uses meters as a unit would simplify some operations
 
-### using R postgis package
+Now that the database is set, we initiate the connection from R
 
-```bash
+
+## Colombian continental territory table
+
+We repeat the same operation for the table containing the polygon of the Colombian continental territory.
+
+```sql
+shp2pgsql -s 3116 -g the_geom ../unsharedData/nonOverlapBuffers/COL_LIMITS.shp col_raw | psql -d park -U park_user
 ```
+
+## Connecting to the database from R
+
+Now that the database is created and the first tables are inserted, we can connect to the database from R:
+
+```{r}
+stopifnot(require(RPostgres),require(sp),require(rgdal),require(rpostgis),require(DBI))
+db_park <- dbConnect(Postgres(), user = "park_user",dbname = "park")
+```
+
+
+
+<!-- Cleaning the database in order to apply the treatment from scratch:
+   ```{r echo=FALSE, results='hide', message=FALSE, warning=FALSE, error=FALSE}
+   tables <- dbListTables(db_park)
+   tablesToSupp <- tables[tables %in%  c("border_park","extracted_points","voronoi_raw","voronoi_park","park","colombia","influence", 'non_ov_buf_5000')]
+   if (length(tablesToSupp) > 0)
+   {
+      lapply(tablesToSupp,dbRemoveTable,conn = db_park)
+   }
+   ```
+-->
+
+
+
+## Cleaning the raw tables
+
+In order to have clean tables with only the useful data, and to speed up the processing, we create the following table (this is not a mandatory operation and you may work directly with the tables you imported in the previous operations, but then you will need to change the field names).
+
+**Creating the park table**:
+
+```{sql connection=db_park}
+CREATE TABLE park
+   (
+      gid integer PRIMARY KEY,
+      name text UNIQUE
+   );
+```
+
+
+**Adding the geometry column**
+
+```{sql connection=db_park}
+SELECT AddGeometryColumn('public','park','the_geom',3116,'MULTIPOLYGON',2);
+```
+
+Note that the polygon of the parks are complex and sometimes in different parts, that's why we use a "MULTIPOLYGON" geometry.
+
+
+**Inserting the data into the park table**
+
+```{sql connection=db_park}
+INSERT INTO park
+   (SELECT gid,nombre,the_geom FROM park_raw);
+```
+
+**Creating the colombia table**
+
+```{sql connection=db_park}
+CREATE TABLE colombia
+   (
+      gid integer PRIMARY KEY,
+      name text UNIQUE
+   );
+```
+
+**Adding a spatial column**
+
+```{sql connection=db_park}
+SELECT AddGeometryColumn('public','colombia','the_geom',3116,'POLYGON',2);
+```
+
+
+**Inserting the data in the colombia table**:
+
+```{sql connection=db_park}
+INSERT INTO colombia
+   (SELECT 1, 'Colombia',(ST_Dump(the_geom)).geom AS the_geom FROM col_raw);
+```
+
+Note: we use the ST_Dump function because the *shp2pgsql* software created a "MULTIPOLYGON" geometry while a simple polygon was sufficient to store the continental territory of Colombia
+
+**Creating spatial indexes to handle more efficiently the spatial geometries**
+
+```{sql connection=db_park}
+CREATE INDEX park_the_geom_gist ON park USING GIST(the_geom);
+```
+
+```{sql connection=db_park}
+CREATE INDEX col_the_geom_gist ON colombia USING GIST(the_geom);
+```
+
+
+
+## Representing the spatial tables
+
+```{r fig.width=7, fig.heigh=7}
+colombia <- pgGetGeom(db_park, name = "colombia", geom = "the_geom")
+park <- pgGetGeom(db_park, name = "park", geom = "the_geom")
+ct_park <- pgGetGeom(db_park, query = "SELECT gid,name, ST_centroid(the_geom) geom FROM park")
+plot(colombia)
+plot(park,add = T)
+text(ct_park,as.character(ct_park@data$gid))
+```
+
+
+# Creating the "influence zones"
+
+
+The idea here is to create "influence zones" in Colombia allowing, for each park to delimitate the territory in which the park is the closest one.
+
+In order to create the influence zones, we will use the Voronoi process (or Thiessen polygons).
+The problem is that the Voronoi process exists only for points, and the parks are polygons.
+
+So what we will do is:
+
+1. extract the borders of the parks
+1. extract points on the border of the parks
+1. create the Voronoi polygons for all of the extracted points
+1. join all the polygons corresponding to one park
+
+## Calculating the distances between parks
+
+In order to see which parks need special attention because they are very close to another one, we check which parks have another park at less than 1 km.
+
+First we add a boolean field to the park table to store this information.
+
+```{sql connection=db_park}
+ALTER TABLE park
+ADD COLUMN close_park BOOLEAN DEFAULT false;
+```
+
+Then we set this field to true when there is another park at less than 1 km.
+
+```{sql connection=db_park}
+WITH close AS(
+   SELECT DISTINCT a.gid
+   FROM park a  JOIN park b ON ST_DWithin(a.the_geom,b.the_geom,1000)
+)
+UPDATE  park
+SET close_park=true
+WHERE gid IN (SELECT gid FROM close);
+```
+
+
+
+## Creating the park border table
+
+```{sql connection=db_park}
+CREATE TABLE border_park AS(
+   SELECT gid, ST_boundary(the_geom) the_geom
+   FROM park
+);
+```
+
+Now we create the spatial index for the border geometries:
+
+```{sql connection=db_park}
+CREATE INDEX border_park_the_geom_gist_idx ON border_park USING GIST(the_geom);
+```
+
+## Extracting points on the borders
+
+Let's take an example of a park, Rio Pure to show how postgis usually extract points from a line geometry:
+
+We will represent this park in red on the Colombian territory:
+
+```{r, out.width="100%"}
+par(mar = rep(0,4))
+plot(colombia)
+plot(park, add=T, col="grey")
+plot(park[park$name == "Rio Pure",],col = "red",add=T)
+```
+
+```{r, out.width="100%"}
+pt_extract <- pgGetGeom(db_park,query =
+      "SELECT (ST_DumpPoints(the_geom)).*
+      FROM border_park
+      WHERE gid=2"
+                           )
+par(mar=rep(0,4))
+plot(park[park$gid == 2,])
+plot(pt_extract,add = T,col = "red")
+```
+
+The points which are extracted are not regularly distributed and may not be sufficient for the Voronoi process.
+Therefore we might need to "segmentize" the borders first:
+
+```{r}
+pt_extract2 <- pgGetGeom(db_park,query =
+      "SELECT (ST_DumpPoints(ST_segmentize(the_geom,100))).*
+      FROM border_park
+      WHERE gid=2"
+                           )
+par(mar=rep(0,4))
+plot(park[park$gid == 2,])
+plot(pt_extract2, cex=1.5, add = T, col= "blue")
+plot(pt_extract, add = T, col = "red")
+```
+
+Now you can see that the points (in blue when we first segmentize the borders) are extracted regurlarly (in fact at least every 100 m) on the border of the park.
+
+
+For the actual parks, we will use a negative buffer of 2m (in order to avoid problems in case of shared borders between 2 parks) and segmentize the border every 20m for parks which are close to another, and segmentize the border every 200m otherwise.
+
+```{sql connection=db_park}
+CREATE TABLE extracted_points AS(
+   SELECT gid, (ST_DumpPoints(ST_Segmentize(ST_Boundary(ST_buffer(the_geom,-2)),20))).*
+   FROM park
+   WHERE close_park
+   UNION ALL
+   SELECT p.gid, (ST_DumpPoints(ST_Segmentize(b.the_geom,200))).*
+   FROM park p
+   JOIN border_park b ON p.gid=b.gid
+   WHERE NOT close_park
+)
+;
+```
+
+```{sql connection=db_park}
+CREATE INDEX extracted_points_the_geom_gist_idx ON extracted_points USING GIST(geom);
+```
+
+**Note**: it creates more than 3.000.000 points, so you might want to adapt the parameters to your case.
+
+## Applying Voronoi on the extracted points
+
+
+```{sql connection=db_park}
+CREATE TABLE voronoi_raw AS(
+   SELECT (ST_Dump(ST_VoronoiPolygons(ST_Collect(geom)))).geom
+   FROM extracted_points
+)
+```
+
+```{sql connection=db_park}
+CREATE INDEX voronoi_raw_geom_gist_idx ON voronoi_raw USING GIST(geom);
+```
+
+## Collecting all the voronoi polygons corresponding to each park
+
+The voronoi process works on a "collection" of points.
+We need now to associate each Voronoi Polygon with the park from which the point was extracted, and concatenate all the polygons corresponding to a park:
+
+```{sql connection=db_park}
+CREATE TABLE voronoi_park AS(
+   SELECT pt.gid,ST_MakeValid(ST_Multi(ST_Union(ST_MakeValid(v.geom)))) the_geom
+   FROM voronoi_raw v
+   JOIN extracted_points pt ON ST_intersects(v.geom,pt.geom)
+   GROUP BY pt.gid
+);
+```
+
+
+**Note**: Because the voronoi process work on millions of points here and that the point configuration may create weird geometries, we need to use the "ST_MakeValid", in order to "clean" the geometries.
+
+Even though we used the ST_MakeValid, if some of the polygons are too thin, they might be interpreted by postgis as lines or points.
+
+So if you still can't read some of the geometries here it might be the problem, here is what you need to do:
+
+```{sql connection=db_park}
+WITH extract_collections AS(
+   SELECT gid, (ST_Dump(the_geom)).geom
+   FROM voronoi_park
+   WHERE GeometryType(the_geom) = 'GEOMETRYCOLLECTION'
+), filter_polyg AS(
+   SELECT gid, ST_Multi(ST_Union(geom)) the_geom
+   FROM extract_collections
+   WHERE GeometryType(geom) = 'POLYGON'
+   GROUP BY gid
+)
+UPDATE voronoi_park p
+SET the_geom=fg.the_geom
+FROM filter_polyg fg
+WHERE p.gid=fg.gid;
+```
+
+
+
+```{sql connection=db_park}
+CREATE INDEX voronoi_park_the_geom_gist_idx ON voronoi_park USING GIST(the_geom);
+```
+
+
+## Representing the influence zones
+
+
+```{r out.width="100%"}
+influences <- pgGetGeom(db_park, "voronoi_park", geom="the_geom")
+par(mar=rep(0,4))
+COL <- rainbow(51)[order(sample(1:51))]
+plot(influences, col = COL[influences$gid],xlim = colombia@bbox["x",], ylim = colombia@bbox["y",])
+plot(colombia,border = "grey", col = NA, add = T, lwd=2)
+plot(park,border = "white", add = T)
+```
+
+
+# Final buffers
+
+## Cutting the Voronoi polygons
+
+In order to have practical influence zones for cutting the buffers, we need the influence zone to exclude the parks and zones outside of Colombia.
+
+```{sql connection=db_park}
+CREATE TABLE influence 
+(
+   gid_park INT PRIMARY KEY REFERENCES park(gid)
+);
+```
+
+```{sql connection=db_park}
+SELECT AddGeometryColumn('public','influence','the_geom',3116,'MULTIPOLYGON',2);
+```
+
+
+```{sql connection=db_park}
+WITH in_colombia AS(
+   SELECT v.gid, ST_Multi(ST_intersection(v.the_geom, c.the_geom)) geom
+   FROM voronoi_park v,colombia c
+), withoutparks AS(
+   SELECT p.gid, ST_Multi(ST_Union(ST_difference(ic.geom,p.the_geom)))
+   FROM in_colombia ic
+   JOIN park p ON ic.gid=p.gid
+   GROUP BY p.gid
+)
+INSERT INTO influence
+(SELECT * FROM withoutparks)
+;
+```
+
+
+```{sql connection=db_park}
+CREATE INDEX influence_the_geom_gist_idx ON influence USING GIST(the_geom);
+```
+
+
+## Representing the final influence table
+
+```{r, out.width="100%"}
+par(mar=rep(0,4))
+inf_final <- pgGetGeom(db_park,"influence",geom='the_geom')
+plot(inf_final,col = COL)
+```
+## Supressing tables
+
+```{r}
+toSupp <- c("border_park","extracted_points","voronoi_raw","voronoi_park")
+lapply(dbListTables(db_park),function(x,y,c)if (x %in% y) dbRemoveTable(c,x) else return(0),c = db_park,y = toSupp)
+```
+
+## Creating non overlapping buffers
+
+
+Now the process of creating buffers can simply be done by keeping the intersection between the influence table and the buffers.
+(here we use buffers of 20 km)
+
+```{sql connection="db_park"}
+CREATE TABLE non_ov_buf_5000 AS(
+   SELECT p.gid gid_park,ST_Multi(ST_Union(ST_intersection(ST_Buffer(p.the_geom, 5000),i.the_geom))) the_geom
+   FROM park p
+   JOIN influence i ON p.gid=i.gid_park
+   GROUP BY p.gid
+);
+```
+
+
+Let's look at the result:
+
+```{r out.width="100%"}
+par(mar=rep(0,4))
+ring_buf_non_ov <- pgGetGeom(db_park, 'non_ov_buf_5000', geom = "the_geom")
+plot(colombia, col = "grey")
+plot(ring_buf_non_ov, col = COL, border = NA, add=T)
+```
+
+If we take a closer look in a particularly complicated zone, we obtain:
+
+```{r out.width="100%"}
+par(mar=rep(0,4))
+plot(park[park$gid %in% c(16,15,20),],col = "grey")
+plot(ring_buf_non_ov[ring_buf_non_ov$gid_park %in% c(16,15,20),], col = rainbow(3), add = T)
+```
+
+# Conclusion
+
+The method we used, based on Voronoi/Thiessen polygons allowed us to create buffer zone to the Colombian natural parks, with no overlap between the buffers of close natural parks.
+Used in a scientific article on the comparison of deforestation in the parks and their buffer zones, it allowed Rubiano *et al* (in prep) to ensure that no area was accounted for more than once in the analyses.
